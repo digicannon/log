@@ -34,7 +34,9 @@ static HANDLE print_changes_mutex;
 typedef struct {
     bool quiet;
     bool verbose;
-    bool print_headers;
+    bool print_headers; // Result of quiet and verbose flags.
+
+    bool resume; // Don't print existing file contents before watching.
 } Options;
 static Options options;
 
@@ -154,6 +156,7 @@ int _print_changes(HANDLE handle, __int64 file_size, const wchar_t * filename) {
         total_read += single_read_count;
     }
 
+    free(buffer);
     return 0;
 }
 
@@ -267,8 +270,15 @@ DWORD watch_file(const wchar_t * fullpath) {
         return win_err(fullpath);
     }
 
-    // Before we start listening for changes, print the current state of the file.
-    print_changes(file_handle, get_file_size(file_handle), fullpath);
+    if (options.resume) {
+        LARGE_INTEGER size = { 0 };
+        if (GetFileSizeEx(file_handle, &size)) {
+            SetFilePointerEx(file_handle, size, nullptr, FILE_BEGIN);
+        }
+    } else {
+        // Before we start listening for changes, print the current state of the file.
+        print_changes(file_handle, get_file_size(file_handle), fullpath);
+    }
 
     dir_handle = CreateFileW(dirpath, FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     if (IS_HANDLE_BAD(dir_handle)) {
@@ -322,6 +332,9 @@ bool option_switch(wchar_t flag) {
     case L'q':
         options.quiet = true;
         options.verbose = false;
+        break;
+    case L'r':
+        options.resume = true;
         break;
     case L'v':
         options.quiet = false;
