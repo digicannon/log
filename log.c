@@ -38,13 +38,16 @@ typedef struct {
 } Options;
 static Options options;
 
-void output(const wchar_t * msg) {
+void output_no_lock(const wchar_t * msg) {
     DWORD written;
+    WriteConsoleW(conout, msg, (DWORD)wcslen(msg), &written, nullptr);
+}
 
+void output(const wchar_t * msg) {
     WaitForSingleObject(con_mutex, INFINITE);
 
-    WriteConsoleW(conout, msg, (DWORD)wcslen(msg), &written, nullptr);
-    WriteConsoleW(conout, L"\r\n", 2, &written, nullptr);
+    output_no_lock(msg);
+    output_no_lock(L"\r\n");
     OutputDebugStringW(msg);
     OutputDebugStringW(L"\r\n");
 
@@ -132,7 +135,14 @@ int _print_changes(HANDLE handle, __int64 file_size, const wchar_t * filename) {
     }
 
     if (options.print_headers) {
-        outputf(L"==> %s <==", filename);
+        // The filenames don't get reallocated ever, so we can compare pointers.
+        static const wchar_t * last_filename = nullptr;
+        if (last_filename != filename) {
+            output_no_lock(L"\r\n==> ");
+            output_no_lock(filename);
+            output_no_lock(L" <==\r\n");
+            last_filename = filename;
+        }
     }
 
     while (total_read < total_to_read) {
@@ -144,18 +154,15 @@ int _print_changes(HANDLE handle, __int64 file_size, const wchar_t * filename) {
         total_read += single_read_count;
     }
 
-    {
-        DWORD unused;
-        WriteConsoleA(conout, "\r\n", 2, &unused, nullptr);
-    }
-
     return 0;
 }
 
 int print_changes(HANDLE handle, __int64 file_size, const wchar_t * filename) {
     int ret;
     WaitForSingleObject(print_changes_mutex, INFINITE);
+    WaitForSingleObject(con_mutex, INFINITE);
     ret = _print_changes(handle, file_size, filename);
+    ReleaseMutex(con_mutex);
     ReleaseMutex(print_changes_mutex);
     return ret;
 }
