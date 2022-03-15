@@ -1,11 +1,14 @@
 #include <stdbool.h>
 #include <limits.h>
 
+#define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include <shellapi.h>
 #include <Shlwapi.h>
 
 // Uncomment to allow "-v" in addition to "/v", for example.
-// #define ARG_SWITCH_ALLOW_DASH 1
+// You will lose the ability to specify files that start with a hyphen.
+//#define ARG_SWITCH_ALLOW_DASH 1
 
 #define nullptr ((void *)0)
 
@@ -13,6 +16,8 @@
 #define zalloc(bytes) HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (bytes));
 #define free(ptr) HeapFree(GetProcessHeap(), 0, (ptr));
 
+// DebugBreak causes some delay if there isn't a debugger,
+// so don't call it in release builds.
 #ifdef _DEBUG
 #define DBG_BREAK() DebugBreak()
 #else
@@ -32,6 +37,8 @@ static HANDLE con_mutex;
 static HANDLE print_changes_mutex;
 
 typedef struct {
+    bool help;
+
     bool quiet;
     bool verbose;
     bool print_headers; // Result of quiet and verbose flags.
@@ -40,16 +47,32 @@ typedef struct {
 } Options;
 static Options options;
 
-void output_no_lock(const wchar_t * msg) {
+// This intrinsic goes away in release mode?
+#pragma function(memcpy)
+void * memcpy(void * dest, const void * src, size_t size) {
+    unsigned __int8 * curr_dest = (unsigned __int8 *)dest;
+    const unsigned __int8 * curr_src = (unsigned __int8 *)src;
+    while (size--) {
+        *(curr_dest++) = *(curr_src++);
+    }
+    return dest;
+}
+
+void output_no_lock_w(const wchar_t * msg) {
     DWORD written;
     WriteConsoleW(conout, msg, (DWORD)wcslen(msg), &written, nullptr);
+}
+
+void output_no_lock_a(const char * msg) {
+    DWORD written;
+    WriteConsoleA(conout, msg, (DWORD)strlen(msg), &written, nullptr);
 }
 
 void output(const wchar_t * msg) {
     WaitForSingleObject(con_mutex, INFINITE);
 
-    output_no_lock(msg);
-    output_no_lock(L"\r\n");
+    output_no_lock_w(msg);
+    output_no_lock_w(L"\r\n");
     OutputDebugStringW(msg);
     OutputDebugStringW(L"\r\n");
 
@@ -140,9 +163,9 @@ int _print_changes(HANDLE handle, __int64 file_size, const wchar_t * filename) {
         // The filenames don't get reallocated ever, so we can compare pointers.
         static const wchar_t * last_filename = nullptr;
         if (last_filename != filename) {
-            output_no_lock(L"\r\n==> ");
-            output_no_lock(filename);
-            output_no_lock(L" <==\r\n");
+            output_no_lock_w(L"\r\n==> ");
+            output_no_lock_w(filename);
+            output_no_lock_w(L" <==\r\n");
             last_filename = filename;
         }
     }
@@ -329,6 +352,10 @@ DWORD watch_file(const wchar_t * fullpath) {
 
 bool option_switch(wchar_t flag) {
     switch (flag) {
+    case L'h':
+    case L'?':
+        options.help = true;
+        break;
     case L'q':
         options.quiet = true;
         options.verbose = false;
@@ -379,6 +406,25 @@ int wmain(int argc, wchar_t ** argv) {
         }
     }
 
+    if (options.help) {
+        static const char msg[] =
+            "View any log file(s) in real time.\n"
+            "\n"
+            "log [option]... [file]...\n"
+        #if ARG_SWITCH_ALLOW_DASH
+            "Options may be prefixed with / or -\n"
+        #endif
+            "\n"
+            "Options:\n"
+            "  /?, /h \t" "Prints this message and exits.\n"
+            "  /q     \t" "Removes the header when the output switches files.\n"
+            "  /r     \t" "Do not print existing file contents before printing changes.\n"
+            "  /v     \t" "Always show the header, even for just one file.\n"
+            "";
+        output_no_lock_a(msg);
+        return 0;
+    }
+
     if (options.verbose) {
         options.print_headers = true;
     } else if (options.quiet) {
@@ -413,7 +459,6 @@ int wmain(int argc, wchar_t ** argv) {
 
     if (thread_count > 0) {
         WaitForMultipleObjects(thread_count, threads, true, INFINITE);
-        return win_err(L"While waiting for watcher threads");
     }
 
     return 0;
@@ -424,7 +469,6 @@ void entry() {
     wchar_t empty[] = L"";
     wchar_t * empty_ptr = empty;
 
-    int ret;
     int argc = 0;
     wchar_t ** argv;
 
@@ -441,6 +485,5 @@ void entry() {
     con_mutex = CreateMutexW(nullptr, false, nullptr);
     print_changes_mutex = CreateMutexW(nullptr, false, nullptr);
 
-    ret = wmain(argc, argv);
-    ExitProcess(ret);
+    ExitProcess(wmain(argc, argv));
 }
