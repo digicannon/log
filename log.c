@@ -32,6 +32,7 @@
 static HANDLE conin;
 static HANDLE conout;
 static HANDLE conerr;
+static WORD con_initial_attributes;
 static HANDLE con_mutex;
 
 static HANDLE print_changes_mutex;
@@ -134,6 +135,7 @@ DWORD cap_i64_to_i32(__int64 in) {
 
 int _print_changes(HANDLE handle, __int64 file_size, const wchar_t * filename) {
     LARGE_INTEGER curr = { 0 };
+    bool starting_over = false;
     __int64 total_to_read;
     __int64 total_read = 0;
     char * buffer;
@@ -146,6 +148,7 @@ int _print_changes(HANDLE handle, __int64 file_size, const wchar_t * filename) {
         // The writing to this file has started over, probably.
         SetFilePointer(handle, 0, nullptr, FILE_BEGIN);
         curr.QuadPart = 0;
+        starting_over = true;
     }
     total_to_read = file_size - curr.QuadPart;
 
@@ -159,13 +162,31 @@ int _print_changes(HANDLE handle, __int64 file_size, const wchar_t * filename) {
         return win_err(filename);
     }
 
-    if (options.print_headers) {
-        // The filenames don't get reallocated ever, so we can compare pointers.
+    // If options allow for it, print a header when the output switches files.
+    // A file "starting over" is considered switching files.
+    if (options.print_headers || (!options.quiet && starting_over)) {
         static const wchar_t * last_filename = nullptr;
-        if (last_filename != filename) {
-            output_no_lock_w(L"\r\n==> ");
+        static bool have_printed_before = false;
+
+        // The filenames don't get reallocated ever, so we can compare pointers.
+        if (last_filename != filename || starting_over) {
+            WORD attr = con_initial_attributes
+                // Remove RGB components.
+                & ~(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE)
+                // Apply our color.
+                | (starting_over ? (FOREGROUND_RED | FOREGROUND_GREEN) : FOREGROUND_GREEN);
+
+            SetConsoleTextAttribute(conout, attr);
+            if (have_printed_before) {
+                output_no_lock_w(L"\r\n");
+            } else {
+                have_printed_before = true;
+            }
+            output_no_lock_w(L"==> ");
             output_no_lock_w(filename);
             output_no_lock_w(L" <==\r\n");
+            SetConsoleTextAttribute(conout, con_initial_attributes);
+
             last_filename = filename;
         }
     }
@@ -392,6 +413,32 @@ int wmain(int argc, wchar_t ** argv) {
     int thread_count = 0;
     int thread_idx = 0;
 
+    conin  = GetStdHandle(STD_INPUT_HANDLE);
+    conout = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (IS_HANDLE_BAD(conin)) {
+        return win_err(L"Could not get handle to standard output");
+    }
+    conerr = GetStdHandle(STD_ERROR_HANDLE);
+
+    {
+        DWORD mode;
+        CONSOLE_SCREEN_BUFFER_INFO info;
+
+        GetConsoleScreenBufferInfo(conout, &info);
+        con_initial_attributes = info.wAttributes;
+
+        // Try to enable "virtual terminal processing" for escape code support.
+        if (GetConsoleMode(conout, &mode)) {
+            SetConsoleMode(conout, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        }
+    }
+
+    con_mutex = CreateMutexW(nullptr, false, nullptr);
+    print_changes_mutex = CreateMutexW(nullptr, false, nullptr);
+    if (IS_HANDLE_BAD(con_mutex) || IS_HANDLE_BAD(print_changes_mutex)) {
+        return win_err(L"Could not create mutex");
+    }
+
     for (int i = 1; i < argc; ++i) {
         wchar_t * curr = argv[i];
         if (is_arg_a_switch(curr)) {
@@ -464,6 +511,7 @@ int wmain(int argc, wchar_t ** argv) {
     return 0;
 }
 
+// Provide environment for a wmain, and nothing more.
 void entry() {
     const wchar_t * cli = GetCommandLineW();
     wchar_t empty[] = L"";
@@ -477,13 +525,6 @@ void entry() {
         argc = 0;
         argv = &empty_ptr;
     }
-
-    conin  = GetStdHandle(STD_INPUT_HANDLE);
-    conout = GetStdHandle(STD_OUTPUT_HANDLE);
-    conerr = GetStdHandle(STD_ERROR_HANDLE);
-
-    con_mutex = CreateMutexW(nullptr, false, nullptr);
-    print_changes_mutex = CreateMutexW(nullptr, false, nullptr);
 
     ExitProcess(wmain(argc, argv));
 }
