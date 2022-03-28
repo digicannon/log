@@ -29,10 +29,15 @@
 
 #define LI_ZERO ((LARGE_INTEGER){0})
 
+#define DEFAULT_CODEPAGE CP_UTF8
+
 static HANDLE conin;
 static HANDLE conout;
-static HANDLE conerr;
-static WORD con_initial_attributes;
+static struct {
+    DWORD mode;
+    WORD attributes;
+    UINT codepage;
+} con_initial;
 static HANDLE con_mutex;
 
 static HANDLE print_changes_mutex;
@@ -45,8 +50,28 @@ typedef struct {
     bool print_headers; // Result of quiet and verbose flags.
 
     bool resume; // Don't print existing file contents before watching.
+
+    bool oneshot; // Print existing file contents and exit.
 } Options;
 static Options options;
+
+typedef struct {
+    unsigned __int8 values[4];
+    __int8 length;
+    UINT codepage;
+} SupportedBom;
+// For the codepage identifiers, see
+// https://docs.microsoft.com/en-us/windows/win32/intl/code-page-identifiers
+static const SupportedBom supported_boms[] = {
+    {{0xEF, 0xBB, 0xBF}, 3, 65001}, // UTF-8
+
+    {{0xFF, 0xFE}, 2, 1200}, // UTF-16 Little Endian
+    {{0xFE, 0xFF}, 2, 1201}, // UTF-16 Big Endian
+
+    {{0xFF, 0xFE, 0x00, 0x00}, 4, 12000}, // UTF-32 Little Endian
+    {{0x00, 0x00, 0xFE, 0xFF}, 4, 12001}, // UTF-32 Big Endian
+};
+static const int supported_boms_len = sizeof(supported_boms) / sizeof(supported_boms[0]);
 
 // This intrinsic goes away in release mode?
 #pragma function(memcpy)
@@ -59,14 +84,30 @@ void * memcpy(void * dest, const void * src, size_t size) {
     return dest;
 }
 
+#pragma function(memcmp)
+int memcmp(const void * buf1, const void * buf2, size_t size) {
+    const unsigned char * u1 = buf1;
+    const unsigned char * u2 = buf2;
+
+    for (; size--; u1++, u2++) {
+        if (*u1 != *u2) {
+            return (*u1 - *u2);
+        }
+    }
+
+    return 0;
+}
+
 void output_no_lock_w(const wchar_t * msg) {
     DWORD written;
     WriteConsoleW(conout, msg, (DWORD)wcslen(msg), &written, nullptr);
+    OutputDebugStringW(msg);
 }
 
 void output_no_lock_a(const char * msg) {
     DWORD written;
     WriteConsoleA(conout, msg, (DWORD)strlen(msg), &written, nullptr);
+    OutputDebugStringA(msg);
 }
 
 void output(const wchar_t * msg) {
@@ -74,10 +115,20 @@ void output(const wchar_t * msg) {
 
     output_no_lock_w(msg);
     output_no_lock_w(L"\r\n");
-    OutputDebugStringW(msg);
-    OutputDebugStringW(L"\r\n");
 
     ReleaseMutex(con_mutex);
+}
+
+void outputf_no_lock(const wchar_t * fmt, ...) {
+    wchar_t buff[1024 + 1];
+    va_list args;
+
+    va_start(args, fmt);
+    // Yes, writes a null terminator.
+    wvsprintfW(buff, fmt, args);
+    va_end(args);
+
+    output_no_lock_w(buff);
 }
 
 void outputf(const wchar_t * fmt, ...) {
@@ -92,7 +143,7 @@ void outputf(const wchar_t * fmt, ...) {
     output(buff);
 }
 
-DWORD win_err(const wchar_t * prefix) {
+DWORD win_status(const wchar_t * prefix) {
     DWORD err = GetLastError();
     wchar_t msg[512];
     DWORD written;
@@ -112,12 +163,16 @@ DWORD win_err(const wchar_t * prefix) {
         }
     }
 
-    DBG_BREAK();
-
     return err;
 }
 
-DWORD min_dword(DWORD a, DWORD b) {
+DWORD win_err(const wchar_t * prefix) {
+    DWORD err = win_status(prefix);
+    DBG_BREAK();
+    return err;
+}
+
+static DWORD max_dword(DWORD a, DWORD b) {
     if (a > b) {
         return a;
     } else {
@@ -125,7 +180,15 @@ DWORD min_dword(DWORD a, DWORD b) {
     }
 }
 
-DWORD cap_i64_to_i32(__int64 in) {
+static __int64 min_int64(__int64 a, __int64 b) {
+    if (a < b) {
+        return a;
+    } else {
+        return b;
+    }
+}
+
+static DWORD cap_i64_to_i32(__int64 in) {
     if (in <= INT_MAX) {
         return (DWORD)in;
     } else {
@@ -133,7 +196,42 @@ DWORD cap_i64_to_i32(__int64 in) {
     }
 }
 
-int _print_changes(HANDLE handle, __int64 file_size, const wchar_t * filename) {
+// Returns number of bytes the file pointer has been moved forward.
+static int determine_encoding(HANDLE handle, __int64 file_size, UINT * codepage_out) {
+    unsigned __int8 bom[4];
+    DWORD read = 0;
+
+    if (file_size) {
+        memset(bom, 0x98, sizeof(bom)); // Fill with a byte not present in any supported BOM.
+        if (ReadFile(handle, bom, (DWORD)min_int64(file_size, sizeof(bom)), &read, nullptr)) {
+            // Compare supported BOMs against the bytes we just read.
+            for (int i = 0; i < supported_boms_len; ++i) {
+                const SupportedBom * sp = &supported_boms[i];
+
+                if (sp->length > sizeof(bom) || sp->length < 0) {
+                    DBG_BREAK();
+                    continue;
+                }
+
+                if (memcmp(bom, sp->values, sp->length) == 0) {
+                    // Found a supported BOM!
+                    // Move file pointer to the end of the BOM.
+                    SetFilePointer(handle, sp->length, nullptr, FILE_BEGIN);
+                    *codepage_out = sp->codepage;
+                    return sp->length;
+                }
+            }
+        }
+    }
+
+    // The file does not start with a known BOM, so move the pointer back to the start.
+    SetFilePointer(handle, 0, nullptr, FILE_BEGIN);
+    *codepage_out = DEFAULT_CODEPAGE;
+    return 0;
+}
+
+static int _print_changes(HANDLE handle, __int64 file_size, const wchar_t * filename, UINT * codepage) {
+    // @TODO rename curr to pos_reading_from or something that shows its doesnt update in the read loop.
     LARGE_INTEGER curr = { 0 };
     bool starting_over = false;
     __int64 total_to_read;
@@ -156,6 +254,12 @@ int _print_changes(HANDLE handle, __int64 file_size, const wchar_t * filename) {
         return 0;
     }
 
+    // If we are at the start of the file, check for a BOM.
+    if (curr.QuadPart == 0) {
+        int bytes_moved = determine_encoding(handle, total_to_read, codepage);
+        total_to_read -= bytes_moved;
+    }
+
     buffer = zalloc(cap_i64_to_i32(total_to_read));
     if (buffer == nullptr) {
         SetLastError(ERROR_OUTOFMEMORY);
@@ -170,7 +274,7 @@ int _print_changes(HANDLE handle, __int64 file_size, const wchar_t * filename) {
 
         // The filenames don't get reallocated ever, so we can compare pointers.
         if (last_filename != filename || starting_over) {
-            WORD attr = con_initial_attributes
+            WORD attr = con_initial.attributes
                 // Remove RGB components.
                 & ~(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE)
                 // Apply our color.
@@ -185,11 +289,13 @@ int _print_changes(HANDLE handle, __int64 file_size, const wchar_t * filename) {
             output_no_lock_w(L"==> ");
             output_no_lock_w(filename);
             output_no_lock_w(L" <==\r\n");
-            SetConsoleTextAttribute(conout, con_initial_attributes);
+            SetConsoleTextAttribute(conout, con_initial.attributes);
 
             last_filename = filename;
         }
     }
+
+    SetConsoleOutputCP(codepage ? *codepage : con_initial.codepage);
 
     while (total_read < total_to_read) {
         read_succ = ReadFile(handle, buffer, cap_i64_to_i32(total_to_read - total_read), &single_read_count, nullptr);
@@ -204,17 +310,17 @@ int _print_changes(HANDLE handle, __int64 file_size, const wchar_t * filename) {
     return 0;
 }
 
-int print_changes(HANDLE handle, __int64 file_size, const wchar_t * filename) {
+static int print_changes(HANDLE handle, __int64 file_size, const wchar_t * filename, UINT * codepage) {
     int ret;
     WaitForSingleObject(print_changes_mutex, INFINITE);
     WaitForSingleObject(con_mutex, INFINITE);
-    ret = _print_changes(handle, file_size, filename);
+    ret = _print_changes(handle, file_size, filename, codepage);
     ReleaseMutex(con_mutex);
     ReleaseMutex(print_changes_mutex);
     return ret;
 }
 
-__int64 get_file_size(HANDLE handle) {
+static __int64 get_file_size(HANDLE handle) {
     LARGE_INTEGER size = { 0 };
     if (!GetFileSizeEx(handle, &size)) {
         return 0;
@@ -222,7 +328,7 @@ __int64 get_file_size(HANDLE handle) {
     return size.QuadPart;
 }
 
-wchar_t * wstr_dup(const wchar_t * src) {
+static wchar_t * wstr_dup(const wchar_t * src) {
     size_t len = wcslen(src);
     size_t size = (len + 1) * sizeof(wchar_t);
     wchar_t * d = malloc(size);
@@ -232,7 +338,7 @@ wchar_t * wstr_dup(const wchar_t * src) {
     return d;
 }
 
-void split_path_to_dir_and_name(const wchar_t * fullpath, wchar_t ** dir_out, wchar_t ** name_out) {
+static void split_path_to_dir_and_name(const wchar_t * fullpath, wchar_t ** dir_out, wchar_t ** name_out) {
     const size_t fullpath_len = wcslen(fullpath);
     signed __int64 split_point = -1;
 
@@ -275,13 +381,15 @@ void split_path_to_dir_and_name(const wchar_t * fullpath, wchar_t ** dir_out, wc
     }
 }
 
-DWORD watch_file(const wchar_t * fullpath) {
+static DWORD watch_file(const wchar_t * fullpath) {
     wchar_t * dirpath = nullptr;
     wchar_t * filename = nullptr;
     int filename_len = 0;
 
     HANDLE file_handle;
     HANDLE dir_handle;
+    UINT file_codepage = con_initial.codepage;
+
     FILE_NOTIFY_EXTENDED_INFORMATION * buffer = nullptr;
     DWORD buffer_size = 0;
     DWORD written = 0;
@@ -317,11 +425,17 @@ DWORD watch_file(const wchar_t * fullpath) {
     if (options.resume) {
         LARGE_INTEGER size = { 0 };
         if (GetFileSizeEx(file_handle, &size)) {
+            determine_encoding(file_handle, size.QuadPart, &file_codepage);
             SetFilePointerEx(file_handle, size, nullptr, FILE_BEGIN);
         }
     } else {
         // Before we start listening for changes, print the current state of the file.
-        print_changes(file_handle, get_file_size(file_handle), fullpath);
+        print_changes(file_handle, get_file_size(file_handle), fullpath, &file_codepage);
+    }
+
+    if (options.oneshot) {
+        CloseHandle(file_handle);
+        return 0;
     }
 
     dir_handle = CreateFileW(dirpath, FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
@@ -330,7 +444,7 @@ DWORD watch_file(const wchar_t * fullpath) {
     }
 
     // First guess for size would be a notification for only the watched file.
-    buffer_size = min_dword(
+    buffer_size = max_dword(
         (DWORD)(sizeof(*buffer) + (wcslen(filename) * sizeof(wchar_t))),
         1024);
     // This must be aligned by at least a DWORD, which HeapAlloc will satisfy.
@@ -350,7 +464,7 @@ DWORD watch_file(const wchar_t * fullpath) {
                         current->FileName, current->FileNameLength / sizeof(wchar_t),
                         filename, filename_len)
                         == CSTR_EQUAL) {
-                        print_changes(file_handle, current->FileSize.QuadPart, fullpath);
+                        print_changes(file_handle, current->FileSize.QuadPart, fullpath, &file_codepage);
                     }
 
                     // Break out if there is no next entry.
@@ -371,7 +485,7 @@ DWORD watch_file(const wchar_t * fullpath) {
     return 0;
 }
 
-bool option_switch(wchar_t flag) {
+static bool option_switch(wchar_t flag) {
     switch (flag) {
     case L'h':
     case L'?':
@@ -384,6 +498,9 @@ bool option_switch(wchar_t flag) {
     case L'r':
         options.resume = true;
         break;
+    case L'o':
+        options.oneshot = true;
+        break;
     case L'v':
         options.quiet = false;
         options.verbose = true;
@@ -394,7 +511,7 @@ bool option_switch(wchar_t flag) {
     return true;
 }
 
-bool is_arg_a_switch(const wchar_t * arg) {
+static bool is_arg_a_switch(const wchar_t * arg) {
     if (arg[0] == L'/') {
         return true;
     }
@@ -408,28 +525,63 @@ bool is_arg_a_switch(const wchar_t * arg) {
     return false;
 }
 
+static void exit(int status) {
+    // Restore the console to its original state.
+    WaitForSingleObject(con_mutex, INFINITE);
+    SetConsoleMode(conout, con_initial.mode);
+    SetConsoleTextAttribute(conout, con_initial.attributes);
+    SetConsoleOutputCP(con_initial.codepage);
+
+    ExitProcess(status);
+}
+
+static BOOL con_handler_routine(DWORD control_type) {
+    switch (control_type) {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+        exit(0);
+        return true;
+    default:
+        return false;
+    }
+}
+
 int wmain(int argc, wchar_t ** argv) {
     HANDLE * threads;
     int thread_count = 0;
     int thread_idx = 0;
 
     conin  = GetStdHandle(STD_INPUT_HANDLE);
-    conout = GetStdHandle(STD_OUTPUT_HANDLE);
     if (IS_HANDLE_BAD(conin)) {
         return win_err(L"Could not get handle to standard output");
     }
-    conerr = GetStdHandle(STD_ERROR_HANDLE);
+    conout = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (IS_HANDLE_BAD(conout)) {
+        return win_err(L"Could not get handle to standard output");
+    }
 
     {
-        DWORD mode;
         CONSOLE_SCREEN_BUFFER_INFO info;
 
-        GetConsoleScreenBufferInfo(conout, &info);
-        con_initial_attributes = info.wAttributes;
+        if (GetConsoleScreenBufferInfo(conout, &info)) {
+            con_initial.attributes = info.wAttributes;
+        } else {
+            // Typical initial attributes.
+            con_initial.attributes = FOREGROUND_BLUE | FOREGROUND_GREEN | FOREGROUND_RED;
+        }
 
         // Try to enable "virtual terminal processing" for escape code support.
-        if (GetConsoleMode(conout, &mode)) {
-            SetConsoleMode(conout, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        if (GetConsoleMode(conout, &con_initial.mode)) {
+            SetConsoleMode(conout, con_initial.mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        } else {
+            // Typical initial mode.
+            con_initial.mode = ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+        }
+
+        con_initial.codepage = GetConsoleOutputCP();
+
+        if (!SetConsoleCtrlHandler(con_handler_routine, true)) {
+            win_err(L"Failed to set control handler");
         }
     }
 
@@ -466,6 +618,7 @@ int wmain(int argc, wchar_t ** argv) {
             "  /?, /h \t" "Prints this message and exits.\n"
             "  /q     \t" "Removes the header when the output switches files.\n"
             "  /r     \t" "Do not print existing file contents before printing changes.\n"
+            "  /o     \t" "Print existing file contents and exit.\n"
             "  /v     \t" "Always show the header, even for just one file.\n"
             "";
         output_no_lock_a(msg);
@@ -495,19 +648,23 @@ int wmain(int argc, wchar_t ** argv) {
                 return ERROR_ASSERTION_FAILURE;
             }
 
-            if (thread_count == 1) {
-                // This is the only file specified, just run on the main thread.
-                return watch_file(argv[i]);
+            if (options.oneshot || thread_count == 1) {
+                // Either we're in oneshot mode or this is the only file specified.
+                // No need to spawn a thread.
+                // In the case of oneshot mode, this also guarantees
+                // the files are printed in the order given.
+                watch_file(argv[i]);
             } else {
                 threads[thread_idx++] = CreateThread(nullptr, 0, &watch_file, argv[i], 0, nullptr);
             }
         }
     }
 
-    if (thread_count > 0) {
+    if (thread_count > 1) {
         WaitForMultipleObjects(thread_count, threads, true, INFINITE);
     }
 
+    exit(0);
     return 0;
 }
 
