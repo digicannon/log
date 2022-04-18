@@ -59,14 +59,15 @@ typedef struct {
     unsigned __int8 values[4];
     __int8 length;
     UINT codepage;
+    bool write_wide;
 } SupportedBom;
 // For the codepage identifiers, see
 // https://docs.microsoft.com/en-us/windows/win32/intl/code-page-identifiers
 static const SupportedBom supported_boms[] = {
     {{0xEF, 0xBB, 0xBF}, 3, 65001}, // UTF-8
 
-    {{0xFF, 0xFE}, 2, 1200}, // UTF-16 Little Endian
-    {{0xFE, 0xFF}, 2, 1201}, // UTF-16 Big Endian
+    {{0xFF, 0xFE}, 2, 1200, true}, // UTF-16 Little Endian
+    {{0xFE, 0xFF}, 2, 1201, true}, // UTF-16 Big Endian
 
     {{0xFF, 0xFE, 0x00, 0x00}, 4, 12000}, // UTF-32 Little Endian
     {{0x00, 0x00, 0xFE, 0xFF}, 4, 12001}, // UTF-32 Big Endian
@@ -197,7 +198,7 @@ static DWORD cap_i64_to_i32(__int64 in) {
 }
 
 // Returns number of bytes the file pointer has been moved forward.
-static int determine_encoding(HANDLE handle, __int64 file_size, UINT * codepage_out) {
+static int determine_encoding(HANDLE handle, __int64 file_size, UINT * codepage_out, bool * write_wide_out) {
     unsigned __int8 bom[4];
     DWORD read = 0;
 
@@ -218,6 +219,7 @@ static int determine_encoding(HANDLE handle, __int64 file_size, UINT * codepage_
                     // Move file pointer to the end of the BOM.
                     SetFilePointer(handle, sp->length, nullptr, FILE_BEGIN);
                     *codepage_out = sp->codepage;
+                    *write_wide_out = sp->write_wide;
                     return sp->length;
                 }
             }
@@ -227,10 +229,11 @@ static int determine_encoding(HANDLE handle, __int64 file_size, UINT * codepage_
     // The file does not start with a known BOM, so move the pointer back to the start.
     SetFilePointer(handle, 0, nullptr, FILE_BEGIN);
     *codepage_out = DEFAULT_CODEPAGE;
+    *write_wide_out = false;
     return 0;
 }
 
-static int _print_changes(HANDLE handle, __int64 file_size, const wchar_t * filename, UINT * codepage) {
+static int _print_changes(HANDLE handle, __int64 file_size, const wchar_t * filename, UINT * codepage, bool * write_wide) {
     // @TODO rename curr to pos_reading_from or something that shows its doesnt update in the read loop.
     LARGE_INTEGER curr = { 0 };
     bool starting_over = false;
@@ -239,6 +242,7 @@ static int _print_changes(HANDLE handle, __int64 file_size, const wchar_t * file
     char * buffer;
     bool read_succ;
     DWORD single_read_count;
+    DWORD single_print_count;
 
     SetFilePointerEx(handle, LI_ZERO, &curr, FILE_CURRENT);
 
@@ -256,8 +260,13 @@ static int _print_changes(HANDLE handle, __int64 file_size, const wchar_t * file
 
     // If we are at the start of the file, check for a BOM.
     if (curr.QuadPart == 0) {
-        int bytes_moved = determine_encoding(handle, total_to_read, codepage);
+        int bytes_moved = determine_encoding(handle, total_to_read, codepage, write_wide);
         total_to_read -= bytes_moved;
+    }
+
+    // If the file is to be written 2 bytes at a time, make sure the size is even.
+    if (*write_wide) {
+        total_to_read &= (MAXINT64 - 1);
     }
 
     buffer = zalloc(cap_i64_to_i32(total_to_read));
@@ -300,7 +309,11 @@ static int _print_changes(HANDLE handle, __int64 file_size, const wchar_t * file
     while (total_read < total_to_read) {
         read_succ = ReadFile(handle, buffer, cap_i64_to_i32(total_to_read - total_read), &single_read_count, nullptr);
         if (read_succ && single_read_count > 0) {
-            WriteConsoleA(conout, buffer, single_read_count, &single_read_count, nullptr);
+            if (*write_wide) {
+                WriteConsoleW(conout, buffer, single_read_count / sizeof(wchar_t), &single_print_count, nullptr);
+            } else {
+                WriteConsoleA(conout, buffer, single_read_count, &single_print_count, nullptr);
+            }
         }
 
         total_read += single_read_count;
@@ -310,11 +323,11 @@ static int _print_changes(HANDLE handle, __int64 file_size, const wchar_t * file
     return 0;
 }
 
-static int print_changes(HANDLE handle, __int64 file_size, const wchar_t * filename, UINT * codepage) {
+static int print_changes(HANDLE handle, __int64 file_size, const wchar_t * filename, UINT * codepage, bool * write_wide) {
     int ret;
     WaitForSingleObject(print_changes_mutex, INFINITE);
     WaitForSingleObject(con_mutex, INFINITE);
-    ret = _print_changes(handle, file_size, filename, codepage);
+    ret = _print_changes(handle, file_size, filename, codepage, write_wide);
     ReleaseMutex(con_mutex);
     ReleaseMutex(print_changes_mutex);
     return ret;
@@ -389,6 +402,7 @@ static DWORD watch_file(const wchar_t * fullpath) {
     HANDLE file_handle;
     HANDLE dir_handle;
     UINT file_codepage = con_initial.codepage;
+    bool file_write_wide = false;
 
     FILE_NOTIFY_EXTENDED_INFORMATION * buffer = nullptr;
     DWORD buffer_size = 0;
@@ -425,12 +439,12 @@ static DWORD watch_file(const wchar_t * fullpath) {
     if (options.resume) {
         LARGE_INTEGER size = { 0 };
         if (GetFileSizeEx(file_handle, &size)) {
-            determine_encoding(file_handle, size.QuadPart, &file_codepage);
+            determine_encoding(file_handle, size.QuadPart, &file_codepage, &file_write_wide);
             SetFilePointerEx(file_handle, size, nullptr, FILE_BEGIN);
         }
     } else {
         // Before we start listening for changes, print the current state of the file.
-        print_changes(file_handle, get_file_size(file_handle), fullpath, &file_codepage);
+        print_changes(file_handle, get_file_size(file_handle), fullpath, &file_codepage, &file_write_wide);
     }
 
     if (options.oneshot) {
@@ -464,7 +478,7 @@ static DWORD watch_file(const wchar_t * fullpath) {
                         current->FileName, current->FileNameLength / sizeof(wchar_t),
                         filename, filename_len)
                         == CSTR_EQUAL) {
-                        print_changes(file_handle, current->FileSize.QuadPart, fullpath, &file_codepage);
+                        print_changes(file_handle, current->FileSize.QuadPart, fullpath, &file_codepage, &file_write_wide);
                     }
 
                     // Break out if there is no next entry.
@@ -525,9 +539,14 @@ static bool is_arg_a_switch(const wchar_t * arg) {
     return false;
 }
 
-static void exit(int status) {
+static void exit_process(int status) {
     // Restore the console to its original state.
-    WaitForSingleObject(con_mutex, INFINITE);
+    if (WaitForSingleObject(con_mutex, 1500) == WAIT_TIMEOUT) {
+    #ifdef _DEBUG
+        output_no_lock_w(L"Timed out waiting for con_mutex!");
+    #endif
+        DBG_BREAK();
+    }
     SetConsoleMode(conout, con_initial.mode);
     SetConsoleTextAttribute(conout, con_initial.attributes);
     SetConsoleOutputCP(con_initial.codepage);
@@ -539,7 +558,7 @@ static BOOL con_handler_routine(DWORD control_type) {
     switch (control_type) {
     case CTRL_C_EVENT:
     case CTRL_BREAK_EVENT:
-        exit(0);
+        exit_process(0);
         return true;
     default:
         return false;
@@ -664,7 +683,7 @@ int wmain(int argc, wchar_t ** argv) {
         WaitForMultipleObjects(thread_count, threads, true, INFINITE);
     }
 
-    exit(0);
+    exit_process(0);
     return 0;
 }
 
